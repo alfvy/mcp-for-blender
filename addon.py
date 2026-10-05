@@ -23,7 +23,7 @@ from datetime import datetime
 import hashlib, hmac, base64
 import os.path as osp
 from collections import deque
-from urllib.parse import quote, urlencode, urlparse, urlunparse, parse_qsl
+from urllib.parse import quote, quote_plus, urlencode, urlparse, urlunparse, parse_qsl
 from contextlib import contextmanager, redirect_stdout, suppress
 from bpy.app.handlers import persistent
 
@@ -255,6 +255,477 @@ def _polypizza_cdn_error(status_code, headers, content):
             "expired; search again to get a fresh one."
         )
     return "Poly Pizza returned a file that is not a valid GLB (missing glTF magic bytes)"
+
+#endregion
+
+#region Blendkit constants and helpers
+
+BLENDKIT_API_BASE = "https://www.blendkit.com/api/v1"
+BLENDKIT_SITE = "https://www.blendkit.com"
+
+# Blendkit is the only library here that needs no API key. Its public search and
+# download endpoints answer anonymously for free assets, so unlike Poly Pizza and
+# Sketchfab there is nothing for the user to sign up for and paste into the
+# sidebar. Requests are still versioned in the User-Agent so Blendkit can tell
+# which integration its traffic is coming from.
+BLENDKIT_HEADERS = dict(REQ_HEADERS)
+BLENDKIT_HEADERS["User-Agent"] = (
+    "blender-mcp/" + ".".join(str(part) for part in bl_info["version"])
+    + " (+https://github.com/ahujasid/blender-mcp)"
+)
+
+# (connect, read). The read timeout is per socket read, so streaming an 8k
+# texture or a 900MB HDR never trips it - but a dead connection does not hang
+# Blender's main thread indefinitely.
+BLENDKIT_API_TIMEOUT = (10, 30)
+BLENDKIT_FILE_TIMEOUT = (10, 120)
+BLENDKIT_CHUNK_SIZE = 1024 * 1024
+
+# Asset types the search accepts. `all` is not a value the API understands: it
+# has to be omitted, which the caller does by filtering across types itself.
+BLENDKIT_ASSET_TYPES = ("model", "material", "hdr", "scene", "brush", "nodegroup")
+
+# The per-plan access label on every search result. Anything else than "free"
+# cannot be downloaded without a Full Plan account, and asking for one gets a
+# 401 rather than a file - so those are filtered out rather than offered.
+BLENDKIT_ACCESS_FREE = "free"
+
+# Models, materials, scenes, brushes and node groups are .blend files and are
+# appended. glTF exists only for models, and is a conversion of the .blend
+# rather than the artist's own file, so it is a fallback for a .blend written by
+# a newer Blender than the one running - the same case _polyhaven_blend_version
+# exists for.
+BLENDKIT_MODEL_FALLBACK_FORMAT = "gltf"
+
+# The resolution ladder, as the API's fileType strings. Ordered small to large
+# so "the biggest available" is a comparison rather than a guess. These are
+# texture/HDR resolutions baked into the .blend, not separate downloadable
+# models: selecting one picks which file to transfer, and it can cost 400x the
+# 0.5K one, so the caller is told what the bytes will be.
+BLENDKIT_RESOLUTIONS = (
+    "resolution_0_5K", "resolution_1K", "resolution_2K",
+    "resolution_4K", "resolution_8K",
+)
+
+BLENDKIT_SEARCH_LIMIT = 20
+BLENDKIT_SEARCH_MAX_LIMIT = 50
+
+# Blendkit has no autocomplete or suggestion endpoint, and no per-asset record
+# endpoint to fetch a thumbnail from either. Thumbnails come from the search
+# result, as a public CDN URL with the size in the suffix, so a preview costs
+# no extra request at all.
+BLENDKIT_PREVIEW_SIZE = 256
+BLENDKIT_THUMBNAIL_SIZES = (256, 512, 1024)
+
+# How long a resolved download URL stays valid. Blendkit signs the file URL it
+# hands back with `?verify=<epoch>-<hmac>` and the epoch is the moment of the
+# request, so a resolved URL is not worth keeping - and re-resolving is one
+# cheap request anyway.
+BLENDKIT_URL_TTL = 0
+
+# A stable id for this Blender session, sent as `scene_uuid` on every search and
+# download. Blendkit counts asset usage per scene and rejects a download
+# without it - but with a 403 whose body reads "Parameter scene_uuid not set",
+# which looks exactly like an authentication failure and is not one. Any value
+# is accepted; this only has to be stable within the session so a re-download
+# is attributed the same way.
+_blendkit_scene_uuid = None
+
+# What an import that brings in no datablocks reports, so the caller can say so
+# rather than reaching for a None.
+_BLENDKIT_NOTHING = {"collections": [], "objects": [], "materials": [], "node_groups": []}
+
+
+class BlendkitAPIError(Exception):
+    """A non-2xx from Blendkit, with the status and body kept.
+
+    The body matters: Blendkit distinguishes "you need to log in" (401) from
+    "that file needs a Full Plan" and "send a scene_uuid" through it, and a
+    bare status code cannot tell those apart.
+    """
+
+    def __init__(self, status, detail=None):
+        super().__init__(f"HTTP {status}" + (f": {detail}" if detail else ""))
+        self.status = status
+        self.detail = detail or ""
+
+
+def _blendkit_scene_id():
+    """The per-session scene id Blendkit wants on search and download."""
+    global _blendkit_scene_uuid
+    if _blendkit_scene_uuid is None:
+        _blendkit_scene_uuid = str(uuid.uuid4())
+    return _blendkit_scene_uuid
+
+
+def _blendkit_api_get(path, params=None):
+    """GET a Blendkit API endpoint, raising BlendkitAPIError on anything but 2xx."""
+    response = requests.get(
+        f"{BLENDKIT_API_BASE}/{path}",
+        params=params,
+        headers=BLENDKIT_HEADERS,
+        timeout=BLENDKIT_API_TIMEOUT,
+    )
+
+    if response.status_code >= 400:
+        detail = ""
+        with suppress(Exception):
+            payload = response.json()
+            if isinstance(payload, dict):
+                detail = str(payload.get("detail") or payload.get("error") or "")
+        raise BlendkitAPIError(response.status_code, detail)
+
+    return response
+
+
+def _blendkit_search_error(error):
+    """Turn a failed search into something the caller can act on."""
+    if error.status == 401:
+        return ("Blendkit rejected the search as unauthenticated. Search needs no API key, "
+                "so this is a problem on Blendkit's side rather than a missing credential.")
+    if error.status == 429:
+        return "Blendkit is rate limiting this address. Wait a moment and search again."
+    if error.detail:
+        return f"Blendkit search failed ({error.status}): {error.detail}"
+    return f"Blendkit search failed with HTTP {error.status}."
+
+
+def _blendkit_download_error(error):
+    """Turn a failed resolve or transfer into something the caller can act on.
+
+    The two statuses worth distinguishing here are 401, which is what a Full Plan
+    asset answers with, and 403 "Parameter scene_uuid not set", which is our own
+    bug rather than a permissions problem and reads exactly like one.
+    """
+    if error.status == 401:
+        return ("Blendkit refused the download: this asset is not on the free plan and "
+                "needs a Blendkit Full Plan account. Search again and pick one whose "
+                "access label is Free.")
+    if error.status == 403 and "scene_uuid" in (error.detail or ""):
+        return ("Blendkit rejected the download because no scene id was sent. This is a bug "
+                "in the integration, not a permissions problem - please report it.")
+    if error.status == 404:
+        return (f"Blendkit no longer has a file for this asset ({error.detail or 'not found'}). "
+                "It may have been re-uploaded; search again for a current version.")
+    if error.status == 429:
+        return "Blendkit is rate limiting downloads from this address. Wait a moment."
+    if error.detail:
+        return f"Blendkit download failed ({error.status}): {error.detail}"
+    return f"Blendkit download failed with HTTP {error.status}."
+
+
+def _blendkit_valid_asset_id(asset_id):
+    """Blendkit asset ids are version UUIDs, used in filenames and URLs."""
+    if not asset_id or not isinstance(asset_id, str):
+        return False
+    return bool(re.fullmatch(r"[A-Za-z0-9_-]{1,64}", asset_id))
+
+
+# Radiance image suffixes, for the asset types that ship a picture rather than a
+# .blend. Only HDR does: its files report fileType "blend" while being .exr.
+BLENDKIT_IMAGE_SUFFIXES = (".exr", ".hdr")
+
+
+def _blendkit_file_suffix(entry):
+    """The real extension of a file entry, lower-cased, or "".
+
+    Taken from the published filename because `fileType` cannot be trusted for
+    this: every file on an HDR asset reports "blend" while shipping OpenEXR.
+    """
+    name = (entry or {}).get("filename") or ""
+    _, ext = osp.splitext(name)
+    return ext.lower()
+
+
+def _blendkit_valid_file_uuid(file_uuid):
+    """File uuids arrive from the API and are appended to the resolve URL."""
+    return bool(file_uuid) and bool(re.fullmatch(r"[A-Za-z0-9_-]{1,64}", str(file_uuid)))
+
+
+def _blendkit_query_text(query, fields):
+    """Build the `query` string, where every filter is a +field:value term.
+
+    This is not a set of query parameters: Blendkit's search takes one
+    Lucene-ish string, and the addon builds it the same way
+    (search.query_to_url in the Blendkit repo). A field it does not recognise is
+    ignored by the server without complaint, which is why asset_type is the
+    only field validated here.
+    """
+    terms = []
+    keywords = (query or "").strip()
+    if keywords:
+        terms.append(quote_plus(keywords))
+    for field, value in (fields or {}).items():
+        if value is None or value == "":
+            continue
+        terms.append(f"+{field}:{quote_plus(str(value))}")
+    return " ".join(terms)
+
+
+def _blendkit_resolution_name(resolution):
+    """Map a caller's resolution onto the API's fileType for it.
+
+    Callers say "2k", "4K" or "2K"; the API spells them "resolution_2K", with
+    0.5K written "resolution_0_5K". Matching on the caller's spelling directly
+    would silently miss every one of them.
+    """
+    text = str(resolution).strip().lower()
+    if text.startswith("resolution_"):
+        text = text[len("resolution_"):]
+    text = text.replace(".", "_")
+
+    for name in BLENDKIT_RESOLUTIONS:
+        digits = name.split("_", 1)[1].lower()   # "2k", "0_5k"
+        if digits == text or digits.replace("_", "") == text.replace("_", ""):
+            return name
+    # Unknown: passed through so the caller gets an error naming what does
+    # exist, rather than a silent fallback to something else.
+    return f"resolution_{text}"
+
+
+def _blendkit_available_resolutions(asset):
+    """The resolutions this asset publishes, smallest first."""
+    published = {f.get("fileType") for f in (asset.get("files") or [])}
+    return [r for r in BLENDKIT_RESOLUTIONS if r in published]
+
+
+def _blendkit_pick_file(asset, file_type):
+    """The file entry of `file_type` for this asset, or None."""
+    for entry in asset.get("files") or []:
+        if entry.get("fileType") == file_type:
+            return entry
+    return None
+
+
+def _blendkit_summarize_asset(asset):
+    """Trim an API record to the fields worth sending back over MCP.
+
+    The raw record is ~4KB per asset - mostly social links, marketing label
+    plumbing and per-avatar URL variants - so an unpaged 20 results is 80KB of
+    which almost none is decision-relevant.
+    """
+    author = asset.get("author") or {}
+    params = asset.get("dictParameters") or {}
+    files = asset.get("files") or []
+
+    blend = next((f for f in files if f.get("fileType") == "blend"), None)
+    gltf = next((f for f in files if f.get("fileType") == "gltf"), None)
+    # Not every asset is a .blend. A handful publish a zip archive instead, and
+    # unpacking somebody's archive layout blind is not something to do on a
+    # path chosen by a remote API - so those are reported rather than offered.
+    zip_file = next((f for f in files if f.get("fileType") == "zip_file"), None)
+
+    summary = {
+        "id": asset.get("id"),
+        "asset_base_id": asset.get("assetBaseId"),
+        "name": asset.get("name") or asset.get("displayName"),
+        "asset_type": asset.get("assetType"),
+        "description": asset.get("description"),
+        "author": author.get("fullName") if isinstance(author, dict) else None,
+        "tags": asset.get("tags") or [],
+        "category": asset.get("category"),
+        "license": asset.get("license"),
+        "access": asset.get("access"),
+        "access_label": asset.get("accessLabel"),
+        "can_download": bool(asset.get("canDownload")),
+        "is_free": bool(asset.get("isFree")),
+        "verification_status": asset.get("verificationStatus"),
+        "source_app_version": asset.get("sourceAppVersion"),
+        "resolutions": _blendkit_available_resolutions(asset),
+        "url": f"{BLENDKIT_SITE}/assets/{quote(str(asset.get('id') or ''), safe='')}/",
+        "thumbnail": asset.get("thumbnailSmallUrl") or asset.get("thumbnailMiddleUrl"),
+        "download_size": (blend or {}).get("fileUploadSize"),
+        "gltf_download_size": (gltf or {}).get("fileUploadSize"),
+    }
+
+    # Whether this can be imported at all, and if not why. Surfaced so the
+    # caller never picks an asset that cannot be brought in.
+    if blend:
+        summary["importable"] = True
+        if _blendkit_file_suffix(blend) in BLENDKIT_IMAGE_SUFFIXES:
+            # Shipped as a radiance image, so it is applied to the scene's world
+            # rather than appended. Worth saying: it is a different kind of
+            # import, and a caller expecting geometry would be surprised.
+            summary["import_kind"] = "world"
+        else:
+            summary["import_kind"] = "append"
+    elif gltf:
+        summary["importable"] = True
+        summary["import_note"] = ("published as glTF only, so its materials are a conversion "
+                                  "rather than the ones the artist built")
+    elif zip_file:
+        summary["importable"] = False
+        summary["import_note"] = "published as a zip archive, which this integration cannot unpack"
+    else:
+        summary["importable"] = False
+        summary["import_note"] = "publishes no importable file"
+
+    # The numbers that decide whether an asset is usable at the scale it will be
+    # used at. A 1.4m-face tree and a 400-face rock are both "a tree".
+    for field, key in (
+        ("faceCount", "face_count"),
+        ("textureResolutionMax", "texture_resolution"),
+        ("dimensionX", "dimension_x"),
+        ("dimensionY", "dimension_y"),
+        ("dimensionZ", "dimension_z"),
+        ("objectCount", "object_count"),
+    ):
+        if params.get(field) is not None:
+            summary[key] = params[field]
+
+    # Blender 5 saved it and this is 4.2: the .blend cannot be opened at all.
+    written_by = summary["source_app_version"]
+    if written_by and "." in str(written_by):
+        with suppress(ValueError):
+            major, minor = str(written_by).split(".")[:2]
+            summary["blender_version"] = (int(major), int(minor))
+    if gltf:
+        summary["has_gltf"] = True
+
+    return summary
+
+
+# The size is encoded in the published thumbnail's filename suffix, as
+# `.256x256_q85_crop-,.jpg` (the `-,` is a literal, URL-encoded on the wire).
+# The CDN derives the image from it, so a different size costs no stored file.
+_BLENDKIT_THUMB_SUFFIX_RE = re.compile(
+    r"\.(\d{2,4})x(\d{2,4})_q85_crop-[^.]*(\.\w+)$")
+
+
+def _blendkit_preview_url(thumbnail_url, size=None):
+    """Resize a published thumbnail by substituting the size in its path.
+
+    Returns the URL unchanged when it does not carry the expected suffix, so an
+    unfamiliar thumbnail shape still produces a working preview rather than
+    something mangled.
+    """
+    if not thumbnail_url:
+        return None
+    size = size or BLENDKIT_PREVIEW_SIZE
+
+    match = _BLENDKIT_THUMB_SUFFIX_RE.search(thumbnail_url)
+    if not match:
+        return thumbnail_url
+
+    # Only sizes the CDN is actually known to serve; anything else 404s, and a
+    # preview that fails is worse than a smaller one that works.
+    wanted = size if size in BLENDKIT_THUMBNAIL_SIZES else BLENDKIT_THUMBNAIL_SIZES[0]
+    return _BLENDKIT_THUMB_SUFFIX_RE.sub(
+        rf".{wanted}x{wanted}_q85_crop-,{match.group(3)}", thumbnail_url, count=1)
+
+
+def _blendkit_asset_record(asset_id):
+    """One asset's metadata by its version id, or None if there is no such asset.
+
+    The detail endpoint (`/assets/<id>/`) serves the version uuid that search
+    results carry, and answers 404 for an `assetBaseId`, so this takes the
+    version id and nothing else. It is the only anonymous route to a single
+    asset: the search endpoint cannot filter on the version id, and the
+    `asset_base_id:` term it does accept is a different uuid.
+    """
+    try:
+        payload = _blendkit_api_get(
+            f"assets/{quote(asset_id, safe='')}/").json()
+    except BlendkitAPIError as e:
+        if e.status == 404:
+            return None
+        raise
+    return payload if isinstance(payload, dict) and payload.get("files") else None
+
+
+def _blendkit_download(file_url, dest_path):
+    """Stream a resolved file URL to disk, in chunks, reporting nothing.
+
+    Streaming rather than .content is not an optimisation here: a free 8k HDR
+    is 39MB and the largest blend I measured 948MB, and .content would hold all
+    of it in memory on Blender's main thread.
+    """
+    with requests.get(
+        file_url,
+        headers=BLENDKIT_HEADERS,
+        timeout=BLENDKIT_FILE_TIMEOUT,
+        stream=True,
+    ) as response:
+        if response.status_code >= 400:
+            raise BlendkitAPIError(response.status_code, "file download failed")
+
+        with open(dest_path, "wb") as out:
+            for chunk in response.iter_content(chunk_size=BLENDKIT_CHUNK_SIZE):
+                if chunk:
+                    out.write(chunk)
+
+
+def _blendkit_resolve_download(download_url, file_type=None):
+    """Turn a file's `downloadUrl` into a signed URL on the asset CDN.
+
+    `downloadUrl` in a search result is not a file. It is a resolution endpoint
+    that answers {"fileType", "uuid", "filePath"}, and it requires `scene_uuid`:
+    without it the answer is a 403 whose body is "Parameter scene_uuid not
+    set". The filePath it returns carries a short-lived `?verify=` signature, so
+    this is called immediately before the transfer and never cached.
+
+    For a Full Plan asset the same call answers 401 "Unauthorized access. Please
+    log in." - which is the only place the free tier actually bites, since
+    search hands back a downloadUrl for paid assets too.
+    """
+    if not download_url:
+        raise BlendkitAPIError(400, "no download URL on this file")
+
+    # Appended as a parameter rather than rebuilt, so a URL that already carries
+    # the scene_uuid from a previous resolve is not corrupted.
+    separator = "&" if "?" in download_url else "?"
+    url = f"{download_url}{separator}scene_uuid={_blendkit_scene_id()}"
+
+    response = _blendkit_api_get_url(url)
+    payload = response.json()
+    if not isinstance(payload, dict):
+        raise BlendkitAPIError(502, "unexpected resolve response")
+
+    file_path = payload.get("filePath")
+    if not file_path:
+        raise BlendkitAPIError(404, "Blendkit returned no file path for this file")
+    if file_type and payload.get("fileType") and payload["fileType"] != file_type:
+        raise BlendkitAPIError(
+            502, f"Blendkit resolved a {payload['fileType']} where a {file_type} was asked for")
+
+    return file_path
+
+
+def _blendkit_api_get_url(url):
+    """GET an absolute Blendkit URL, raising BlendkitAPIError on anything but 2xx."""
+    response = requests.get(
+        url, headers=BLENDKIT_HEADERS, timeout=BLENDKIT_API_TIMEOUT)
+
+    if response.status_code >= 400:
+        detail = ""
+        with suppress(Exception):
+            payload = response.json()
+            if isinstance(payload, dict):
+                detail = str(payload.get("detail") or "")
+        raise BlendkitAPIError(response.status_code, detail)
+
+    return response
+
+
+def _blendkit_tag(datablocks, asset_id, author=None, license_name=None):
+    """Stamp provenance onto imported datablocks as custom properties.
+
+    Blendkit's free tier is royalty-free rather than CC0, so unlike Poly Haven
+    there is nothing to attribute - but the asset's origin and licence still
+    need to outlive the session, and a custom property is saved into the .blend
+    where a chat message is not.
+    """
+    for block in datablocks:
+        if block is None:
+            continue
+        with suppress(TypeError, AttributeError):
+            block["blendkit_asset_id"] = asset_id
+            block["blendkit_url"] = f"{BLENDKIT_SITE}/assets/{quote(str(asset_id), safe='')}/"
+            if author:
+                block["blendkit_author"] = author
+            if license_name:
+                block["blendkit_license"] = license_name
+
 
 #endregion
 
@@ -1516,6 +1987,7 @@ class BlenderMCPServer:
             "get_hyper3d_status": self.get_hyper3d_status,
             "get_sketchfab_status": self.get_sketchfab_status,
             "get_polypizza_status": self.get_polypizza_status,
+            "get_blendkit_status": self.get_blendkit_status,
             "get_hunyuan3d_status": self.get_hunyuan3d_status,
             "get_tripo_status": premium_tripo_status,
             "export_scene": self.export_scene,
@@ -1549,6 +2021,19 @@ class BlenderMCPServer:
                 "download_sketchfab_model": self.download_sketchfab_model,
             }
             handlers.update(sketchfab_handlers)
+
+        # Add Blendkit handlers only if enabled.
+        # getattr, not attribute access: a scene property added in a later
+        # addon version is absent from anything constructed before it, and one
+        # missing flag must not take every other integration's commands down
+        # with it.
+        if getattr(bpy.context.scene, "blendermcp_use_blendkit", False):
+            blendkit_handlers = {
+                "search_blendkit_assets": self.search_blendkit_assets,
+                "get_blendkit_asset_preview": self.get_blendkit_asset_preview,
+                "download_blendkit_asset": self.download_blendkit_asset,
+            }
+            handlers.update(blendkit_handlers)
 
         # Add Poly Pizza handlers only if enabled
         if bpy.context.scene.blendermcp_use_polypizza:
@@ -3430,6 +3915,644 @@ class BlenderMCPServer:
             print(f"BlenderMCP: could not sync manual edit handlers: {e}")
 
         return {"consent": bool(consent)}
+
+    #region Blendkit
+    def get_blendkit_status(self):
+        """Get the current status of the Blendkit integration.
+
+        No API key: Blendkit's public search and download endpoints answer for
+        free assets without one, so the enabled flag is the whole setup.
+        """
+        enabled = bpy.context.scene.blendermcp_use_blendkit
+        if enabled:
+            return {
+                "enabled": True,
+                "message": "Blendkit integration is enabled and ready to use. "
+                           "No API key is needed: free assets are served anonymously.",
+            }
+        return {
+            "enabled": False,
+            "message": """Blendkit integration is currently disabled. To enable it:
+                        1. In the 3D Viewport, find the MCP for Blender panel in the sidebar (press N if hidden)
+                        2. Check the 'Use assets from Blendkit' checkbox
+                        3. Restart the connection to Claude""",
+        }
+
+    def search_blendkit_assets(self, query=None, asset_type="model", limit=None,
+                               max_face_count=None, blender_version=None):
+        """Search Blendkit's library, keeping only what the free plan can download.
+
+        Parameters:
+        - query: Free-text keywords. Omitted, the most relevant recent assets come back.
+        - asset_type: One of model, material, hdr, scene, brush, nodegroup
+        - limit: Maximum results (default 20, max 50)
+        - max_face_count: Drop models denser than this many faces. Blendkit's
+          models span a few hundred to several million polygons, and nothing in
+          the result otherwise distinguishes a hero prop from background clutter.
+        - blender_version: Drop assets saved by a newer Blender than this
+          (major, minor), which cannot be opened at all.
+        """
+        try:
+            if asset_type not in BLENDKIT_ASSET_TYPES:
+                return {"error": f"Invalid asset type: {asset_type}. Must be one of: "
+                                 f"{', '.join(BLENDKIT_ASSET_TYPES)}"}
+
+            try:
+                limit = int(limit) if limit else BLENDKIT_SEARCH_LIMIT
+            except (TypeError, ValueError):
+                limit = BLENDKIT_SEARCH_LIMIT
+            limit = max(1, min(limit, BLENDKIT_SEARCH_MAX_LIMIT))
+
+            fields = {"asset_type": asset_type}
+
+            # `is_free:true` looks like the filter for this and is not: with and
+            # without it the API returns byte-identical results and the same
+            # count. Access is a per-asset field, so the free plan is applied to
+            # the response below instead.
+            if max_face_count:
+                try:
+                    faces = int(max_face_count)
+                except (TypeError, ValueError):
+                    return {"error": f"max_face_count must be a number, got {max_face_count!r}"}
+                fields["faceCount_lte"] = faces
+
+            if blender_version:
+                if not isinstance(blender_version, (list, tuple)) or len(blender_version) != 2:
+                    return {"error": "blender_version must be a (major, minor) pair, "
+                                     f"got {blender_version!r}"}
+                try:
+                    major, minor = int(blender_version[0]), int(blender_version[1])
+                except (TypeError, ValueError):
+                    return {"error": f"blender_version must be numbers, got {blender_version!r}"}
+                # Blender sorts these as numbers, so 4.10 has to become 4.100
+                # or it sorts below 4.9.
+                fields["sourceAppVersion_gte"] = f"{major}.{minor:03d}"
+                fields["sourceAppVersion_lt"] = f"{major + 1}.{minor:03d}"
+
+            params = {
+                # A query of only +field:value terms is what an empty keyword
+                # search produces, and Blendkit answers it - so the fallback is
+                # for the case where every term was dropped, not the normal one.
+                "query": _blendkit_query_text(query, fields) or "*",
+                # Without this the response repeats the entire parameter list
+                # per asset, roughly doubling its size.
+                "dict_parameters": 1,
+                # Over-fetched because the free filter below only ever shrinks
+                # the page: filtering a page the server already cut leaves the
+                # matches that were further down it.
+                "page_size": min(BLENDKIT_SEARCH_MAX_LIMIT, limit * 3),
+                "scene_uuid": _blendkit_scene_id(),
+            }
+
+            try:
+                response = _blendkit_api_get("search/", params=params)
+            except BlendkitAPIError as e:
+                return {"error": _blendkit_search_error(e)}
+
+            payload = response.json()
+            results = payload.get("results") if isinstance(payload, dict) else None
+            if not isinstance(results, list):
+                return {"error": "Blendkit returned an unexpected search response"}
+
+            total = payload.get("count", len(results))
+            # How many results this page actually held, so the caller can say
+            # "13 of the 50 we looked at" rather than implying 13 of `total` -
+            # which would be a coverage claim, and a wrong one.
+            checked = len(results)
+
+            # Over-fetched above because filtering only shrinks the page, and the
+            # matches that survive would otherwise be the ones further down it.
+            filtered = [a for a in results
+                        if isinstance(a, dict)
+                        and a.get("access") == BLENDKIT_ACCESS_FREE
+                        and a.get("canDownload")]
+
+            notes = []
+            if not filtered and total:
+                # Saying "Blendkit has none of this" when it has forty that need a
+                # Full Plan account is a much worse answer than saying so, and an
+                # empty result set reads as exactly that.
+                free_available = sum(
+                    1 for a in results
+                    if isinstance(a, dict) and a.get("access") == BLENDKIT_ACCESS_FREE
+                )
+                if free_available:
+                    notes.append(
+                        f"{free_available} free {asset_type} assets matched, but all of them "
+                        "are saved by a newer Blender than this one. Lower blender_version, "
+                        "or leave it out.")
+                else:
+                    notes.append(
+                        f"None of the {total} matching {asset_type} assets are on the free "
+                        "plan. Blendkit's free tier covers a large share of its library but "
+                        "not all of it; try different keywords, or another asset type. It "
+                        "has very few free node groups in particular.")
+
+            selected = filtered[:limit]
+
+            return {
+                "assets": [_blendkit_summarize_asset(a) for a in selected],
+                "total_count": total,
+                "free_count": len(filtered),
+                "checked_count": checked,
+                "returned_count": len(selected),
+                "query": (query or "").strip() or None,
+                "asset_type": asset_type,
+                "note": " ".join(notes) if notes else None,
+            }
+        except Exception as e:
+            traceback.print_exc()
+            return {"error": str(e)}
+
+    def get_blendkit_asset_preview(self, asset_id, thumbnail_url=None, size=None):
+        """Fetch an asset's thumbnail so it can be looked at before downloading.
+
+        Blendkit needs no per-asset record endpoint for this: the search result
+        already carries the thumbnail URL, and the caller passes it back so the
+        preview matches exactly the asset that was searched for.
+
+        A thumbnail is a few kilobytes against a model's 83MB .blend, so
+        checking one first is cheaper than importing the wrong tree.
+        """
+        try:
+            if not _blendkit_valid_asset_id(asset_id):
+                return {"error": f"Invalid asset id: {asset_id!r}. Blendkit asset ids are "
+                                 "letters, digits, hyphens and underscores."}
+
+            # A URL handed back from a search result is the CDN's, and is used as
+            # given: rebuilding it here would risk serving a different asset's
+            # image if the id and the URL ever disagree.
+            url = _blendkit_preview_url(thumbnail_url, size) if thumbnail_url else None
+            if not url:
+                return {"error": f"No thumbnail URL was supplied for {asset_id}. "
+                                 "Pass thumbnail_url from the search result."}
+
+            response = requests.get(url, headers=BLENDKIT_HEADERS,
+                                    timeout=BLENDKIT_API_TIMEOUT)
+            if response.status_code >= 400:
+                return {"error": f"Failed to fetch the thumbnail: HTTP {response.status_code}"}
+
+            content_type = getattr(response, "headers", {}).get("Content-Type", "")
+            image_format = "png" if "png" in content_type or url.endswith(".png") else "jpeg"
+
+            return {
+                "success": True,
+                "image_data": base64.b64encode(response.content).decode("ascii"),
+                "format": image_format,
+                "asset_id": asset_id,
+                "url": f"{BLENDKIT_SITE}/assets/{quote(asset_id, safe='')}/",
+            }
+        except Exception as e:
+            traceback.print_exc()
+            return {"error": f"Failed to get asset preview: {str(e)}"}
+
+    def _blendkit_import_environment(self, asset, entry, suffix):
+        """Load a radiance image as the scene's world and return the report.
+
+        An HDR asset's files are OpenEXR or .hdr pictures, not .blends, so there
+        is nothing to append - the file is the lighting. Loaded into a new world
+        rather than over an existing one, because wiping the node tree of
+        whatever world is already in the scene destroys hand-built setups.
+
+        The image is packed, so the world keeps its lighting after the temporary
+        file is deleted and after the .blend is saved and reopened elsewhere.
+        """
+        asset_id = asset.get("id")
+        name = asset.get("name") or asset_id
+        dest_dir = tempfile.mkdtemp(prefix="blender_mcp_blendkit_")
+        dest_path = os.path.join(dest_dir, f"{asset_id}{suffix}")
+
+        try:
+            file_path = _blendkit_resolve_download(
+                entry["downloadUrl"], entry.get("fileType"))
+            _blendkit_download(file_path, dest_path)
+        except BlendkitAPIError as e:
+            shutil.rmtree(dest_dir, ignore_errors=True)
+            return {"error": _blendkit_download_error(e)}
+        except Exception as e:
+            shutil.rmtree(dest_dir, ignore_errors=True)
+            return {"error": f"Failed to download '{name}': {str(e)}"}
+
+        try:
+            image = bpy.data.images.load(dest_path, check_existing=True)
+            image.name = f"{name}_{entry.get('fileType')}"
+
+            world = bpy.data.worlds.new(f"Blendkit {name}")
+            bpy.context.scene.world = world
+            world.use_nodes = True
+            tree = world.node_tree
+            tree.nodes.clear()
+
+            coord = tree.nodes.new(type='ShaderNodeTexCoord')
+            coord.location = (-800, 0)
+            mapping = tree.nodes.new(type='ShaderNodeMapping')
+            mapping.location = (-600, 0)
+            env = tree.nodes.new(type='ShaderNodeTexEnvironment')
+            env.location = (-400, 0)
+            env.image = image
+            background = tree.nodes.new(type='ShaderNodeBackground')
+            background.location = (-200, 0)
+            output = tree.nodes.new(type='ShaderNodeOutputWorld')
+            output.location = (0, 0)
+
+            tree.links.new(coord.outputs['Generated'], mapping.inputs['Vector'])
+            tree.links.new(mapping.outputs['Vector'], env.inputs['Vector'])
+            tree.links.new(env.outputs['Color'], background.inputs['Color'])
+            tree.links.new(background.outputs['Background'], output.inputs['Surface'])
+
+            # Packed before the temporary file goes away, or the world points at
+            # a path in the OS temp directory and loses its lighting when the
+            # .blend is next opened.
+            with suppress(Exception):
+                image.pack()
+
+            _blendkit_tag([world, image], asset_id,
+                          author=(asset.get("author") or {}).get("fullName"),
+                          license_name=asset.get("license"))
+
+            size_bytes = entry.get("fileUploadSize") or 0
+            transferred = (f"{size_bytes / (1024 * 1024):.0f}MB"
+                           if size_bytes >= 1024 * 1024
+                           else f"{size_bytes / 1024:.0f}KB")
+
+            return {
+                "success": True,
+                "message": (f"Blendkit HDRI '{name}' set as the scene world. "
+                            f"Transferred {transferred}, the {entry.get('fileType')} file. "
+                            "It went into a new world, so any world you had is left intact "
+                            "but no longer active."),
+                "name": name,
+                "asset_type": asset.get("assetType") or "hdr",
+                "asset_id": asset_id,
+                "resolution": entry.get("fileType"),
+                "world": world.name,
+                "image_name": image.name,
+                "author": (asset.get("author") or {}).get("fullName"),
+                "license": asset.get("license"),
+                "url": f"{BLENDKIT_SITE}/assets/{quote(str(asset_id), safe='')}/",
+            }
+        except Exception as e:
+            traceback.print_exc()
+            return {"error": f"Failed to set up '{name}' as a world: {str(e)}"}
+        finally:
+            shutil.rmtree(dest_dir, ignore_errors=True)
+
+    def download_blendkit_asset(self, asset_id, resolution=None, file_format=None):
+        """Download a Blendkit asset and import it into the scene.
+
+        Blendkit serves models, materials, scenes, brushes and node groups as
+        .blend files, which are appended. HDR assets are the exception: their
+        files report the fileType "blend" while shipping OpenEXR pictures, so
+        those are loaded and set as the scene's world instead.
+        """
+        dest_dir = None
+        try:
+            if not _blendkit_valid_asset_id(asset_id):
+                return {"error": f"Invalid asset id: {asset_id!r}. Blendkit asset ids are "
+                                 "letters, digits, hyphens and underscores."}
+            if file_format and file_format != "blend":
+                # Checked before any transfer. glTF exists only for models and is
+                # generated from the .blend, so downloading it when not wanted
+                # would be a large lossy conversion nothing asked for.
+                return {"error": f"Unsupported format: {file_format}. Blendkit assets are "
+                                 "imported from .blend; glTF is used only as a fallback."}
+
+            # Looked up by the id search results actually hand out - the
+            # version uuid - through the asset detail endpoint, which serves it
+            # anonymously and already carries `files`. Looking it up through
+            # search instead needs `asset_base_id:`, a *different* uuid, and the
+            # version id is not a searchable field at all, so every download of
+            # a freshly searched asset came back "no such asset".
+            asset = _blendkit_asset_record(asset_id)
+            if asset is None:
+                return {"error": f"No Blendkit asset found with id {asset_id}"}
+
+            # `access`, not `canDownload`: the detail endpoint does not compute
+            # the per-user entitlement and omits the flag, so requiring it here
+            # rejected every free asset. Search sets it; this endpoint does not.
+            if asset.get("access") != BLENDKIT_ACCESS_FREE:
+                return {
+                    "error": f"'{asset.get('name') or asset_id}' is a "
+                             f"{asset.get('accessLabel') or 'paid'} asset and cannot be "
+                             "downloaded without a Blendkit Full Plan account. "
+                             f"Search again with a free-only filter; {BLENDKIT_SITE} "
+                             "lists what the free plan covers."
+                }
+
+            asset_type = asset.get("assetType") or "asset"
+
+            # Refused from the metadata, before any transfer. Blender cannot open
+            # a file written by a newer version than itself, and Blendkit's assets
+            # were saved by everything from 2.93 to 5.0 - so this saves
+            # downloading an 80MB .blend to find out it cannot be read. The
+            # .blend's own header is still checked after the transfer, because
+            # the metadata is not guaranteed to be right.
+            written_by = None
+            raw_version = str(asset.get("sourceAppVersion") or "")
+            if raw_version and "." in raw_version:
+                with suppress(ValueError):
+                    major, minor = raw_version.split(".")[:2]
+                    written_by = (int(major), int(minor))
+
+            if written_by and written_by > bpy.app.version[:2]:
+                return {
+                    "error": f"'{asset.get('name') or asset_id}' was saved by Blender "
+                             f"{written_by[0]}.{written_by[1]} and this is "
+                             f"{bpy.app.version[0]}.{bpy.app.version[1]}, which cannot open "
+                             "it. Pass blender_version to search_blendkit_assets to leave "
+                             "these out of the results."
+                }
+
+            files = asset.get("files") or []
+
+            # `resolution` selects which published file to transfer. The
+            # resolution_* files are the same asset baked at different texture
+            # sizes, so the largest is the default and the caller is told what it
+            # costs - the 8K file for a free HDR I measured is 39MB against 200KB
+            # at 0.5K.
+            if resolution:
+                entry = _blendkit_pick_file(asset, _blendkit_resolution_name(resolution))
+                if entry is None:
+                    available = _blendkit_available_resolutions(asset)
+                    return {
+                        "error": f"'{asset.get('name') or asset_id}' has no {resolution}. "
+                                 + (f"It publishes: {', '.join(available)}"
+                                    if available else
+                                    "It publishes no texture resolutions, so download it "
+                                    "without one to get the original file.")
+                    }
+            else:
+                available = _blendkit_available_resolutions(asset)
+                entry = (_blendkit_pick_file(asset, available[-1]) if available else None)
+
+            blend_entry = entry or _blendkit_pick_file(asset, "blend")
+            if blend_entry is None:
+                # A zip archive is not unpacked here: its layout is chosen by the
+                # uploader, and unpacking one blind onto a path a remote API
+                # influenced is how you end up writing outside the temp directory.
+                if _blendkit_pick_file(asset, "zip_file") is not None:
+                    return {
+                        "error": f"'{asset.get('name') or asset_id}' is published as a zip "
+                                 "archive rather than a .blend, which this integration cannot "
+                                 "unpack. Download it from the asset's page and use "
+                                 "File > Import."
+                    }
+                gltf_only = _blendkit_pick_file(asset, "gltf")
+                if gltf_only is not None:
+                    blend_entry = gltf_only
+                else:
+                    return {
+                        "error": f"Blendkit asset {asset_id} publishes no importable file "
+                                 f"(it has: {', '.join(sorted({f.get('fileType') for f in files}))})"
+                    }
+            if not _blendkit_valid_file_uuid(blend_entry.get("uuid")):
+                return {"error": f"Blendkit asset {asset_id} has a malformed file reference"}
+
+            selected_type = blend_entry.get("fileType")
+            # True only when this asset publishes no .blend at all and the glTF
+            # was picked as a substitute. Not simply "fileType isn't blend": the
+            # resolution_0_5K..8K files are .blends too, and they are what a
+            # requested resolution resolves to.
+            via_gltf_only = blend_entry is _blendkit_pick_file(asset, BLENDKIT_MODEL_FALLBACK_FORMAT)
+
+            # What the file really is, from its extension rather than its
+            # fileType. An HDR asset's entries all say "blend" while shipping
+            # OpenEXR images - `blend_3bf04da2-....exr` - so trusting the
+            # fileType sent every HDR to bpy.data.libraries.load, which cannot
+            # read an .exr and silently appends nothing. Every other asset type
+            # really is a .blend.
+            suffix = _blendkit_file_suffix(blend_entry)
+            if suffix in BLENDKIT_IMAGE_SUFFIXES:
+                # An HDR asset: the file is a radiance image, not a .blend, so it
+                # becomes a world rather than an append. Its own temp directory,
+                # removed once the image is packed.
+                return self._blendkit_import_environment(asset, blend_entry, suffix)
+
+            dest_dir = tempfile.mkdtemp(prefix="blender_mcp_blendkit_")
+            dest_path = os.path.join(
+                dest_dir, f"{asset_id}.{'glb' if via_gltf_only else 'blend'}")
+
+            file_path = _blendkit_resolve_download(blend_entry["downloadUrl"], selected_type)
+            _blendkit_download(file_path, dest_path)
+
+            before = {obj.name for obj in bpy.data.objects}
+            fallback_note = (" Imported from glTF: this asset publishes no .blend, so its "
+                             "materials are a conversion rather than the ones the artist built."
+                             if via_gltf_only else "")
+
+            try:
+                if via_gltf_only:
+                    bpy.ops.import_scene.gltf(filepath=dest_path)
+                    added = _BLENDKIT_NOTHING
+                else:
+                    # The .blend's own header, which is authoritative where the
+                    # metadata is only a claim. Assets written by a Blender newer
+                    # than this one cannot be opened at all, and the fix is a
+                    # fallback rather than an error - as it is for Poly Haven,
+                    # whose library spans the same 2.93-to-5.0 range.
+                    written = _polyhaven_blend_version(dest_path)
+                    if written and written > bpy.app.version[:2]:
+                        raise RuntimeError("written by Blender %d.%d" % written)
+                    added = self._blendkit_append_blend(dest_path, asset.get("name"))
+            except Exception as blend_error:
+                traceback.print_exc()
+                gltf_entry = _blendkit_pick_file(asset, BLENDKIT_MODEL_FALLBACK_FORMAT)
+                if via_gltf_only or asset_type != "model" or gltf_entry is None:
+                    return {"error": f"Failed to import {asset_type} {asset_id}: {blend_error}"}
+
+                print(f"Blendkit: .blend import failed ({blend_error}), falling back to glTF")
+                shutil.rmtree(dest_dir, ignore_errors=True)
+                dest_dir = tempfile.mkdtemp(prefix="blender_mcp_blendkit_")
+                dest_path = os.path.join(dest_dir, f"{asset_id}.glb")
+                try:
+                    _blendkit_download(
+                        _blendkit_resolve_download(gltf_entry["downloadUrl"], "gltf"),
+                        dest_path,
+                    )
+                    before = {obj.name for obj in bpy.data.objects}
+                    bpy.ops.import_scene.gltf(filepath=dest_path)
+                    added = _BLENDKIT_NOTHING
+                except Exception as gltf_error:
+                    return {
+                        "error": f"'{asset.get('name') or asset_id}' could not be imported "
+                                 f"from .blend ({blend_error}) and the glTF fallback failed "
+                                 f"too: {gltf_error}"
+                    }
+                fallback_note = (
+                    " Imported from glTF rather than .blend, because the .blend could not be "
+                    "opened. Its materials are a conversion rather than the ones the artist "
+                    "built."
+                )
+
+            # Appended, not glTF-imported: bpy.ops.import_scene.gltf leaves
+            # nothing selected, so the set difference is the only reliable way to
+            # see what arrived.
+            imported = [obj for obj in bpy.data.objects if obj.name not in before]
+            imported_objects = [obj.name for obj in imported]
+
+            # An appended .blend references the images it shipped with by path,
+            # and those paths are in the temporary directory removed on the way
+            # out. Packing puts them in the .blend, so reopening the file still
+            # has its textures. Materials appended directly (a material asset
+            # has no objects to reach them through) are packed here too.
+            materials = list(added["materials"])
+            for group in added["node_groups"]:
+                for node in getattr(group, "nodes", []):
+                    if node.type == 'TEX_IMAGE' and node.image and not node.image.packed_file:
+                        with suppress(Exception):
+                            node.image.pack()
+
+            for obj in imported:
+                for slot in getattr(obj, "material_slots", []):
+                    if slot.material is None:
+                        continue
+                    if slot.material not in materials:
+                        materials.append(slot.material)
+                    if not slot.material.use_nodes:
+                        continue
+                    for node in slot.material.node_tree.nodes:
+                        if node.type == 'TEX_IMAGE' and node.image and not node.image.packed_file:
+                            with suppress(Exception):
+                                node.image.pack()
+
+            for material in materials:
+                if not material.use_nodes:
+                    continue
+                for node in material.node_tree.nodes:
+                    if node.type == 'TEX_IMAGE' and node.image and not node.image.packed_file:
+                        with suppress(Exception):
+                            node.image.pack()
+
+            author = (asset.get("author") or {}).get("fullName")
+            _blendkit_tag(imported + added["collections"] + added["node_groups"] + materials,
+                          asset_id, author=author, license_name=asset.get("license"))
+
+            name = asset.get("name") or asset_id
+            # What actually arrived decides what is said. A material asset has
+            # no objects by nature, and saying "brought in 0 objects" would read
+            # as a failure; but nothing at all arriving is a failure, and saying
+            # otherwise would hide a broken import behind a success.
+            arrived = (imported_objects or added["collections"] or materials
+                       or added["node_groups"])
+            if not arrived:
+                return {
+                    "error": f"Downloaded '{name}' but its .blend held nothing this "
+                             "integration can append. Open it from the asset's page "
+                             f"instead: {BLENDKIT_SITE}/assets/{quote(asset_id, safe='')}/"
+                }
+
+            message = f"Blendkit {asset_type} '{name}' imported successfully."
+            if imported_objects:
+                message += f" Brought in {len(imported_objects)} object(s)."
+            if materials:
+                material_note = ", ".join(m.name for m in materials[:4])
+                message += f" Material(s) added: {material_note}."
+            if added["node_groups"]:
+                message += f" Node group(s) added: {len(added['node_groups'])}."
+            if not imported_objects and not materials and not added["node_groups"]:
+                message += (" No objects - this is a geometry-free asset, so check the "
+                            "outliner for what it added.")
+            size_bytes = blend_entry.get("fileUploadSize") or 0
+            if size_bytes >= 1024 * 1024:
+                transferred = f"{size_bytes / (1024 * 1024):.0f}MB"
+            else:
+                transferred = f"{size_bytes / 1024:.0f}KB"
+            message += (f" Transferred {transferred}, the {selected_type} file - resolution "
+                        "selects the texture size baked into the .blend.")
+            message += fallback_note
+
+            return {
+                "success": True,
+                "message": message,
+                "name": name,
+                "asset_type": asset_type,
+                "asset_id": asset_id,
+                "resolution": selected_type,
+                "imported_objects": imported_objects,
+                "imported_collections": [c.name for c in added["collections"]],
+                "imported_node_groups": [g.name for g in added["node_groups"]],
+                "materials": [m.name for m in materials],
+                "author": author,
+                "license": asset.get("license"),
+                "access_label": asset.get("accessLabel"),
+                "url": f"{BLENDKIT_SITE}/assets/{quote(asset_id, safe='')}/",
+            }
+        except BlendkitAPIError as e:
+            return {"error": _blendkit_download_error(e)}
+        except Exception as e:
+            traceback.print_exc()
+            return {"error": f"Failed to download asset: {str(e)}"}
+        finally:
+            if dest_dir:
+                shutil.rmtree(dest_dir, ignore_errors=True)
+
+    #endregion
+
+    def _blendkit_append_blend(self, blend_path, asset_name=None):
+        """Append a downloaded .blend. Returns what arrived.
+
+        Blendkit's .blends are not all shaped alike, and the difference decides
+        what has to be appended:
+
+        * models and scenes hold collections, usually one named after the asset,
+          sometimes a LOD chain and occasionally a second unrelated model beside
+          it - so the asset's own name picks the collection when one matches;
+        * materials, node groups and worlds hold no collections and no objects
+          at all, only the datablock itself. Appending objects for one of those
+          imports nothing and still reports success, which is how a material
+          download came to "succeed" having brought in no material.
+
+        Returns {"collections", "objects", "materials", "node_groups"} so the
+        caller can report what really arrived rather than assume.
+        """
+        added = {"collections": [], "objects": [], "materials": [], "node_groups": []}
+
+        with bpy.data.libraries.load(blend_path, link=False) as (data_from, data_to):
+            available_collections = list(data_from.collections)
+            available_objects = list(data_from.objects)
+
+            wanted = None
+            if asset_name:
+                slug = re.sub(r"[^A-Za-z0-9_]+", "_", asset_name).strip("_")
+                for candidate in (slug, f"{slug}_LOD0", f"{asset_name}_LOD0", asset_name):
+                    if candidate in available_collections:
+                        wanted = candidate
+                        break
+
+            if wanted:
+                data_to.collections = [wanted]
+            elif available_collections:
+                # A collection exists but none is named after the asset. Appending
+                # all of them is better than nothing, and the response says what
+                # arrived so a stowaway is visible.
+                data_to.collections = data_from.collections
+            elif available_objects:
+                # No collections at all - loose objects.
+                data_to.objects = data_from.objects
+            else:
+                # Not a model or a scene: a material, node group or world file.
+                # These carry no geometry, so they have to be requested by name.
+                data_to.materials = data_from.materials
+                data_to.node_groups = data_from.node_groups
+
+            # Everything below the block: inside it data_to holds the requested
+            # *names*, and Blender swaps in the real datablocks on exit. Reading
+            # them here is what put strings into the report.
+        for collection in data_to.collections:
+            if collection is not None:
+                bpy.context.scene.collection.children.link(collection)
+                added["collections"].append(collection)
+        for obj in data_to.objects:
+            if obj is not None:
+                bpy.context.collection.objects.link(obj)
+                added["objects"].append(obj)
+
+        added["materials"] = [m for m in data_to.materials if m is not None]
+        added["node_groups"] = [g for g in data_to.node_groups if g is not None]
+
+        return added
+
+    #endregion
 
     def get_polyhaven_status(self):
         """Get the current status of PolyHaven integration"""
@@ -5900,6 +7023,14 @@ class BLENDERMCP_PT_Panel(bpy.types.Panel):
                 col.prop(scene, "blendermcp_sketchfab_api_key", text="API Key")
 
         sub = self._integration_header(
+            layout, scene, "blendermcp_use_blendkit", "Blendkit", 'ASSET_MANAGER')
+        if sub:
+            col = sub.column(align=True)
+            col.label(text="Free-plan models, materials, HDRIs and scenes")
+            col.label(text="No API key needed")
+            col.operator("wm.url_open", text="blendkit.com", icon='URL').url = BLENDKIT_SITE
+
+        sub = self._integration_header(
             layout, scene, "blendermcp_use_polypizza", "Poly Pizza", 'MESH_ICOSPHERE')
         if sub:
             col = sub.column(align=True)
@@ -6353,6 +7484,12 @@ def register():
         default=False
     )
 
+    bpy.types.Scene.blendermcp_use_blendkit = bpy.props.BoolProperty(
+        name="Use Blendkit",
+        description="Enable Blendkit asset integration (no API key needed)",
+        default=False
+    )
+
     bpy.types.Scene.blendermcp_use_polypizza = bpy.props.BoolProperty(
         name="Use Poly Pizza",
         description="Enable Poly Pizza asset integration",
@@ -6422,6 +7559,7 @@ def unregister():
     del bpy.types.Scene.blendermcp_use_sketchfab
     del bpy.types.Scene.blendermcp_sketchfab_api_key
     del bpy.types.Scene.blendermcp_use_tripo
+    del bpy.types.Scene.blendermcp_use_blendkit
     del bpy.types.Scene.blendermcp_use_polypizza
     del bpy.types.Scene.blendermcp_polypizza_api_key
     del bpy.types.Scene.blendermcp_use_hunyuan3d

@@ -349,6 +349,7 @@ get_scene_info() to confirm the objects exist.
 Prefer real assets over scripted geometry unless a simple primitive is asked for. Call an
 integration's get_*_status tool before using it. Sources:
 - Poly Haven: HDRIs for lighting, textures, generic models.
+- Blendkit: the largest library, no API key, and artist-authored materials.
 - Sketchfab: realistic and specific real-world models.
 - Poly Pizza: stylised low-poly assets. Credit the creator of CC-BY models.
 - Hyper3D Rodin, Hunyuan3D, Tripo: generate one custom object at a time. Never generate a
@@ -1496,6 +1497,41 @@ async def download_sketchfab_model(
         logger.error(traceback.format_exc())
         return f"Error downloading Sketchfab model: {str(e)}"
 
+def _blendkit_credit(result):
+    """A source line for an imported asset.
+
+    Blendkit's free tier needs no attribution - these assets are royalty-free,
+    which permits commercial use without crediting the author. The API asks that
+    software built on it makes the origin clear, and in an MCP client the chat is
+    the surface the person actually sees.
+    """
+    author = result.get("author")
+    licence = result.get("license")
+    by = f" by {author}" if author else ""
+    lic = f", {licence}" if licence else ""
+    return f"From Blendkit{by} - {result.get('url', 'https://www.blendkit.com')}{lic}."
+
+
+def _blendkit_size_line(asset: dict) -> str:
+    """The one number that decides whether this asset is the right one.
+
+    Blendkit publishes a 948MB original .blend and a 200KB 0.5K version of the
+    same HDR. Neither the name nor the thumbnail says which one is about to be
+    imported, so the size is stated wherever a size is known.
+    """
+    size = asset.get("download_size")
+    if not size:
+        return ""
+    mb = size / (1024 * 1024)
+    if mb < 1:
+        return f"{size / 1024:.0f}KB"
+    return f"{mb:.0f}MB"
+
+
+def _blendkit_thumbnail(asset: dict) -> str | None:
+    return asset.get("thumbnail") or None
+
+
 # Poly Pizza's API filters on numeric ids (Category 0-11; License 0 = CC-BY,
 # 1 = CC0) and silently ignores names. Human-friendly names are resolved here,
 # on the server, which is the single source of truth for the mapping: fixes to
@@ -1578,6 +1614,271 @@ def _polypizza_licence_id(licence):
     if key.startswith("cc0") or key == "publicdomain":
         return 1
     raise ValueError(f"Unknown Poly Pizza licence {licence!r}. Use 'CC0' or 'CC-BY'.")
+
+
+@mcp.tool()
+@telemetry_tool("search_blendkit_assets")
+async def search_blendkit_assets(
+    ctx: Context,
+    query: str = None,
+    asset_type: str = "model",
+    limit: int = 20,
+    max_face_count: int = None,
+    blender_version: tuple = None,
+    user_prompt: str = ""
+) -> str:
+    """
+    Search Blendkit's library of free-plan models, materials, HDRIs, scenes,
+    brushes and node groups. No API key is needed.
+
+    Blendkit is the largest library here - around 30,000 assets - and the one
+    with real artist-made materials and node setups, which Poly Haven and Poly
+    Pizza do not have. Its free plan covers a large share of the library but not
+    all of it, so results are filtered to what can actually be downloaded; a
+    Full Plan asset is never offered, because fetching one fails.
+
+    Parameters:
+    - query: What you are looking for, in plain words ("stone wall", "oak
+      texture", "overcast sky"). Leave it out to browse recent popular assets.
+    - asset_type: model, material, hdr, scene, brush or nodegroup. Note that
+      Blendkit has almost no free node groups - searching that type usually
+      returns nothing, and the response says so rather than staying silent.
+    - limit: How many results to return (default 20, maximum 50)
+    - max_face_count: Drop models denser than this many polygons. Blendkit spans
+      a few hundred faces to several million, and nothing else in a result
+      separates a hero prop from something that will stall a viewport: a 400k
+      face tree and a 400 face one both read as "a tree". Use ~50000 for a prop
+      meant to be seen close up and lower for background or filler geometry.
+    - blender_version: A (major, minor) pair, to drop assets saved by a newer
+      Blender than this one. Blender cannot open a newer file at all, so
+      download_blendkit_asset would fail on it. Leave it out to let Blendkit
+      decide.
+    - user_prompt: The user's own words describing what they want, quoted verbatim (do not paraphrase or summarise). Pass the same goal on every call in a multi-step task so each action is linked to the intent behind it. Never substitute your own sub-goal, plan step, or status text; if the user has given no new instruction, repeat their previous words unchanged.
+
+    Read the face count and file size before picking. Both are the difference
+    between an asset that fits the scene and one that does not, and neither is
+    visible in the thumbnail. A result marked NOT IMPORTABLE ships as a zip
+    archive or a .prxc with nothing this can unpack - pick another.
+
+    Returns each asset's id, name, type, author, licence, tags, face count,
+    dimensions, available resolutions and page URL.
+    """
+    try:
+        blender = get_blender_connection()
+        result = blender.send_command("search_blendkit_assets", {
+            "query": query,
+            "asset_type": asset_type,
+            "limit": limit,
+            "max_face_count": max_face_count,
+            "blender_version": list(blender_version) if blender_version else None,
+        })
+
+        if "error" in result:
+            return f"Error: {result['error']}"
+
+        assets = result["assets"]
+        free_count = result.get("free_count", len(assets))
+
+        if result.get("query"):
+            header = f"{free_count} free {asset_type} assets on Blendkit match '{result['query']}'"
+        else:
+            header = f"{free_count} free {asset_type} assets on Blendkit"
+        if max_face_count:
+            header += f" (up to {max_face_count:,} faces)"
+        total = result.get("total_count")
+        if total and total > free_count:
+            # free_count is how many free results came back in the page that was
+            # fetched, not how many exist. Saying "13 of 4608" would read as a
+            # coverage figure and be badly wrong: the true free total is unknown
+            # without paging the whole library, and for node groups the free few
+            # sit far down the ranking rather than being 1 in 4.
+            checked = result.get("checked_count")
+            header += (f" (Blendkit reports {total:,} matches in total; {free_count} of the "
+                       + (f"{checked} results checked were" if checked else "results checked were")
+                       + " free - the true free total is higher)")
+
+        lines = [header, f"Showing {result['returned_count']}:", ""]
+        if result.get("note"):
+            lines.insert(1, result["note"])
+
+        credit = "Assets from Blendkit (https://www.blendkit.com), free plan, royalty-free licence."
+        blocks = {}
+        options = []
+        for asset in assets:
+            block = [f"- {asset['name']} (ID: {asset['id']})"]
+            meta = [asset.get("asset_type")]
+            if asset.get("author"):
+                meta.append(f"by {asset['author']}")
+            if asset.get("license"):
+                meta.append(asset["license"])
+            block.append("  " + " | ".join(str(m) for m in meta if m) + f"  |  {asset['url']}")
+
+            if asset.get("face_count"):
+                block.append(f"  {asset['face_count']:,} faces")
+            if asset.get("importable") is False:
+                # Said up front rather than discovered on download: a handful of
+                # assets publish a zip archive or a .prxc and nothing importable.
+                block.append(f"  NOT IMPORTABLE - {asset.get('import_note', 'no usable file')}")
+            if all(asset.get(k) for k in ("dimension_x", "dimension_y", "dimension_z")):
+                block.append(
+                    f"  Size: {asset['dimension_x']:.2f} x {asset['dimension_y']:.2f} x "
+                    f"{asset['dimension_z']:.2f} m")
+            if asset.get("texture_resolution"):
+                block.append(f"  Textures up to {asset['texture_resolution']}px")
+            size_line = _blendkit_size_line(asset)
+            if size_line:
+                resolutions = ", ".join(asset.get("resolutions") or []) or "original"
+                block.append(f"  Download: {size_line} (resolutions: {resolutions})")
+            if asset.get("tags"):
+                block.append(f"  Tags: {', '.join(asset['tags'][:8])}")
+            if asset.get("description"):
+                block.append(f"  {asset['description'][:300]}")
+
+            lines.extend(block)
+            lines.append("")
+            blocks[asset["id"]] = "\n".join(block) + f"\n\n{credit}"
+            options.append(PickerOption(
+                id=asset["id"],
+                title=asset["name"],
+                description=" · ".join(filter(None, [
+                    asset.get("asset_type"),
+                    f"{asset['face_count']:,} faces" if asset.get("face_count") else None,
+                    size_line or None,
+                ])),
+                thumbnail=_blendkit_thumbnail(asset),
+            ))
+
+        lines.append(credit)
+        listing = "\n".join(lines)
+        picked = await pick_asset(
+            ctx, f"Pick a Blendkit {asset_type} for: {query or 'your scene'}", "Asset", options)
+        return picked_reply("Blendkit", picked, blocks, listing) if picked else listing
+    except Exception as e:
+        logger.error(f"Error searching Blendkit assets: {str(e)}")
+        return f"Error searching Blendkit assets: {str(e)}"
+
+
+@mcp.tool()
+@telemetry_tool("get_blendkit_asset_preview")
+async def get_blendkit_asset_preview(
+    ctx: Context,
+    asset_id: str,
+    thumbnail_url: str = None,
+    user_prompt: str = ""
+) -> Image:
+    """
+    Get a preview thumbnail of a Blendkit asset by its ID.
+    Use this to check an asset looks right before downloading it.
+
+    A thumbnail is a few kilobytes against a model's 83MB .blend, so looking
+    first is much cheaper than importing the wrong thing and trying again.
+
+    Parameters:
+    - asset_id: The Blendkit asset ID (obtained from search_blendkit_assets)
+    - thumbnail_url: The `thumbnail` URL from the same search result. Blendkit
+      serves thumbnails from a public CDN keyed by the asset, so passing it
+      avoids re-searching for the asset just to look at it.
+    - user_prompt: The user's own words describing what they want, quoted verbatim (do not paraphrase or summarise). Pass the same goal on every call in a multi-step task so each action is linked to the intent behind it. Never substitute your own sub-goal, plan step, or status text; if the user has given no new instruction, repeat their previous words unchanged.
+
+    Returns the asset's thumbnail as an Image.
+    """
+    try:
+        blender = get_blender_connection()
+        logger.info(f"Getting Blendkit preview for: {asset_id}")
+
+        result = blender.send_command("get_blendkit_asset_preview", {
+            "asset_id": asset_id,
+            "thumbnail_url": thumbnail_url,
+        })
+
+        if result is None:
+            raise Exception("Received no response from Blender")
+        if "error" in result:
+            raise Exception(result["error"])
+
+        image_data = base64.b64decode(result["image_data"])
+        logger.info(f"Blendkit preview retrieved for '{result.get('url')}'")
+
+        return Image(data=image_data, format=result.get("format", "jpeg"))
+
+    except Exception as e:
+        logger.error(f"Error getting Blendkit preview: {str(e)}")
+        raise Exception(f"Failed to get preview: {str(e)}")
+
+
+@mcp.tool()
+@trajectory_tool("download_blendkit_asset")
+async def download_blendkit_asset(
+    ctx: Context,
+    asset_id: str,
+    resolution: str = None,
+    user_prompt: str = ""
+) -> str:
+    """
+    Download and import a Blendkit asset into Blender.
+
+    How it arrives depends on the asset type. Models, materials, scenes, brushes
+    and node groups are appended from their .blend: objects and collections land
+    in the scene, and a material or node group appears in the outliner without an
+    object. HDRIs are different - Blendkit ships those as OpenEXR pictures, not
+    .blend files - so they are loaded and set as the scene's world, in a new
+    world rather than over an existing one.
+
+    Parameters:
+    - asset_id: The ID of the asset to download (from search_blendkit_assets)
+    - resolution: Which published file to transfer, as 0.5k, 1k, 2k, 4k or 8k.
+      This is the texture resolution baked into the file, and it is the single
+      biggest decision here: the same HDR is 200KB at 0.5K and 39MB at 8K, and a
+      background asset never needs the difference. Leave it out to get the
+      largest published resolution. search_blendkit_assets reports which
+      resolutions each asset has, and an unavailable one is an error naming the
+      rest rather than a silent fallback.
+    - user_prompt: The user's own words describing what you want, quoted verbatim (do not paraphrase or summarise). Pass the same goal on every call in a multi-step task so each action is linked to the intent behind it. Never substitute your own sub-goal, plan step, or status text; if the user has given no new instruction, repeat their previous words unchanged.
+
+    Returns a message indicating success or failure.
+    """
+    try:
+        blender = get_blender_connection()
+        result = blender.send_command("download_blendkit_asset", {
+            "asset_id": asset_id,
+            "resolution": resolution,
+        })
+
+        if "error" in result:
+            return f"Error: {result['error']}"
+
+        if result.get("success"):
+            message = result.get("message", "Asset downloaded and imported successfully")
+            if result.get("url"):
+                message = f"{message}\n\n{_blendkit_credit(result)}"
+            return message
+
+        return f"Failed to download asset: {result.get('message', 'Unknown error')}"
+    except Exception as e:
+        logger.error(f"Error downloading Blendkit asset: {str(e)}")
+        return f"Error downloading Blendkit asset: {str(e)}"
+
+
+@mcp.tool()
+@telemetry_tool("get_blendkit_status")
+async def get_blendkit_status(ctx: Context, user_prompt: str = "") -> str:
+    """
+    Check if the Blendkit integration is enabled in Blender.
+    Returns a message indicating whether Blendkit features are available.
+    """
+    try:
+        blender = get_blender_connection()
+        result = blender.send_command("get_blendkit_status")
+        enabled = result.get("enabled", False)
+        message = result.get("message", "")
+        if enabled:
+            message += (" Blendkit has the largest library here and needs no API key, "
+                        "and its materials are artist-authored node setups rather than "
+                        "image-only PBR.")
+        return message + _premium_guidance(blender)
+    except Exception as e:
+        logger.error(f"Error checking Blendkit status: {str(e)}")
+        return f"Error checking Blendkit status: {str(e)}"
 
 
 @mcp.tool()

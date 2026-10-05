@@ -188,7 +188,7 @@ The addon starts its server when Blender opens. To check, press `N` in the 3D vi
 | **Material control** | Apply and modify materials and colors |
 | **Scene inspection** | Get detailed information about the current Blender scene |
 | **Code execution** | Run arbitrary Python code in Blender from Claude |
-| **Asset & model generation** | Poly Haven assets, Sketchfab models, Poly Pizza low-poly models, and AI-generated 3D models via Hyper3D Rodin and Hunyuan3D |
+| **Asset & model generation** | Poly Haven assets, Blendkit assets (no API key needed), Sketchfab models, Poly Pizza low-poly models, and AI-generated 3D models via Hyper3D Rodin and Hunyuan3D |
 
 ## Premium
 
@@ -632,6 +632,7 @@ Once the config file has been set on Claude, and the addon is running on Blender
 - Export the scene, the selection or named objects to GLB/FBX for other applications (`export_scene`)
 - Look up node schemas and the bpy API reference instead of guessing socket order or enum names
 - Search and download free CC0 HDRIs, textures and models from [Poly Haven](https://polyhaven.com/)
+- Search and download free-plan models, materials, HDRIs, scenes and node groups from [Blendkit](https://www.blendkit.com/)
 - Search and download models from [Sketchfab](https://sketchfab.com/)
 - Search and download low-poly models from [Poly Pizza](https://poly.pizza/)
 - AI generated 3D models through [Hyper3D Rodin](https://hyper3d.ai/) and [Hunyuan3D](https://3d.hunyuan.tencent.com/)
@@ -689,6 +690,50 @@ import responses name the source and link the asset's page. On import, `polyhave
 `polyhaven_url`, `polyhaven_authors`, `polyhaven_resolution` and `polyhaven_licence` are
 written onto the imported objects, materials, images and world as custom properties, so
 whoever opens the `.blend` later can still find the asset and the artist who made it.
+
+#### Blendkit
+
+[Blendkit](https://www.blendkit.com/) is the largest library here - around 30,000 assets - and
+the one whose materials are artist-authored node setups rather than image-only PBR. It covers
+models, materials, HDRIs, scenes, brushes and node groups.
+
+**No API key, no account.** Free-plan assets are served anonymously, so unlike Sketchfab and
+Poly Pizza there is nothing to sign up for and paste into the sidebar: tick **Blendkit** and
+it works. The only setup is that one checkbox.
+
+Worked example:
+
+> *"Find a low-poly tree for background filler and an oak material for the floor"*
+
+Claude calls `search_blendkit_assets(query="low-poly tree", asset_type="model",
+max_face_count=50000)` - the face-count filter is what separates a hero prop from something
+that will stall a viewport, and nothing else in a result makes that visible - checks the
+thumbnail with `get_blendkit_asset_preview(...)`, then imports with
+`download_blendkit_asset(asset_id="...", resolution="2k")`.
+
+Two things worth knowing about the free plan:
+
+- **Full Plan assets are filtered out of search results**, so they are never offered and then
+  fail. A search whose matches are all paid says so explicitly rather than returning an empty
+  list that reads as "Blendkit has nothing". Blendkit has almost no free node groups, so that
+  asset type usually returns nothing - the response says why.
+- **Resolution is the main cost decision.** Every asset ships as a `.blend` at several texture
+  resolutions, from 0.5K to 8K. The same HDR is 200KB at 0.5K and 39MB at 8K, so ask for what
+  the asset is doing: 0.5K-1K for background or filler, 4K for anything held close to camera.
+  The default is the largest published, and the response states what was transferred.
+
+Assets are imported from the `.blend`, which is the file the artist authored; the glTF is
+generated from it and loses material detail. A `.blend` written by a newer Blender than the
+one running cannot be opened at all, so pass `blender_version=(major, minor)` to
+`search_blendkit_assets` to leave those out, or download one and it is refused before the
+transfer rather than after it.
+
+**Licence:** Blendkit's free plan is **royalty-free**, not CC0. Commercial use is permitted
+and no attribution is required, but it is not a public-domain dedication - the terms differ
+from Poly Haven's in ways that matter if you ship renders. On import, `blendkit_asset_id`,
+`blendkit_url`, `blendkit_author` and `blendkit_license` are written onto the imported
+objects, collections and materials as custom properties, so the origin survives in the
+`.blend`.
 
 #### Poly Pizza
 
@@ -774,6 +819,9 @@ For headless setups or CI, credentials can also be injected by environment varia
 | **Timeout errors** | Try simplifying your requests or breaking them into smaller steps. |
 | **Blender freezes during a Poly Haven download** | Assets are downloaded on Blender's main thread, so the UI stops responding until the transfer finishes. File size grows roughly fourfold per resolution step, so ask for 1k or 2k unless the asset is held close to camera. |
 | **Poly Pizza download fails with a Cloudflare challenge** | `static.poly.pizza` is behind bot protection and blocks datacenter, VPN and cloud IPs. Your API key is fine - the CDN never sees it. Retry from a normal connection, or download the `.glb` by hand and use **File → Import → glTF 2.0**. |
+| **Blender freezes during a Blendkit download** | Same as Poly Haven: downloads run on Blender's main thread. Blendkit's `.blend` files are much larger, and resolution drives the cost sharply - the same HDR is 200KB at 0.5K and 39MB at 8K. Pass `resolution="0.5k"` or `"1k"` for anything that is not held close to camera. |
+| **A Blendkit asset will not open** | It was saved by a newer Blender than the one running, and Blender cannot read a newer file. Search with `blender_version=(major, minor)` to leave those out. If one slips through anyway it is refused before the transfer, not after. |
+| **A Blendkit search returns nothing** | The free plan covers a large share of the library but not all of it, and the response says which case this is. Blendkit also has almost no free node groups - that asset type usually has nothing. |
 | **Have you tried turning it off and on again?** | If you're still having connection errors, try restarting both Claude and the Blender server. |
 
 ## Technical Details
@@ -790,6 +838,7 @@ The system uses a simple JSON-based protocol over TCP sockets:
 > **Warning:** The `execute_blender_code` tool allows running arbitrary Python code in Blender, which can be powerful but potentially dangerous. Use with caution in production environments. **ALWAYS save your work before using it.**
 
 - Poly Haven requires downloading models, textures, and HDRI images. If you do not want to use it, please turn it off in the checkbox in Blender.
+- Blendkit makes requests to blendkit.com to search and download free-plan assets. Its licence is royalty-free rather than CC0, and its API terms are the ones that apply - check them if you plan to ship work built on these assets.
 - Complex operations might need to be broken down into smaller steps.
 
 ## Telemetry Control

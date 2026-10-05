@@ -424,6 +424,7 @@ def _load_addon(monkeypatch):
         blendermcp_use_hunyuan3d=False,
         blendermcp_use_sketchfab=False,
         blendermcp_use_polypizza=False,
+        blendermcp_use_blendkit=False,
     )
     bpy.context = types.SimpleNamespace(
         scene=scene,
